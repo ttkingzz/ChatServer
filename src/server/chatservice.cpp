@@ -28,6 +28,14 @@ ChatService::ChatService()
     _msgHandlerMap.insert( {ADD_GROUP_MSG, bind(&ChatService::addGroup,  this,placeholders::_1 ,placeholders::_2,placeholders::_3)} );
     _msgHandlerMap.insert( {GROUP_CHAT_MSG, bind(&ChatService::groupChat,  this,placeholders::_1 ,placeholders::_2,placeholders::_3)} );
 
+    // 连接redis服务器
+    if (_redis.connect())
+    {
+        // 设置上报消息的回调
+        _redis.init_notify_handler(std::bind(&ChatService::handleRedisSubscribeMessage, this, _1, _2));
+    }
+
+
 }
 
 /*==============错误消息===============*/
@@ -72,6 +80,9 @@ void ChatService::login(const TcpConnectionPtr &conn, json &js,Timestamp time)
                 lock_guard<mutex> lock(_connMutex);  // lock_guard不支持手动解锁，但是比unique_lock轻量
                 _connMap.insert({id, conn});  //确保线程安全
             }
+
+            // id用户登录成功后，向redis订阅channel(id)
+            _redis.subscribe(id); 
 
             user.setState(ONLINE);
             _userModel.updateState(user); //刷新数据并返回
@@ -200,6 +211,10 @@ void ChatService::userLoginout(const TcpConnectionPtr &conn, json &js,Timestamp 
             _connMap.erase(it);
         }
     }
+
+    // 用户注销，相当于就是下线，在redis中取消订阅通道
+    _redis.unsubscribe(userId); 
+
     User user(userId,"","",2);
     _userModel.updateState(user);
 }
@@ -220,6 +235,9 @@ void ChatService::clientClosedException(const TcpConnectionPtr &conn)
             }
         }
     }
+    
+    // 用户注销，相当于就是下线，在redis中取消订阅通道
+    _redis.unsubscribe(user.getID()); 
 
     if(user.getID() != -1)
     {
@@ -238,8 +256,9 @@ void ChatService::oneChat(const TcpConnectionPtr &conn, json &js,Timestamp time)
     LOG_INFO << js.dump();
     int toid = js["toid"].get<int>();
     // int localId = js["id"].get<int>();
-    lock_guard<mutex> lock(_connMutex);
+    
     {
+        lock_guard<mutex> lock(_connMutex);
         auto it = _connMap.find(toid);  // _connMap存储的是所有在线用户的信息
         if(it!=_connMap.end())
         {
@@ -247,10 +266,19 @@ void ChatService::oneChat(const TcpConnectionPtr &conn, json &js,Timestamp time)
             // 服务器主动推送消息  conn->send
             it->second->send(js.dump());    // conn->send() 服务站主动推送消息
             return ;  //返回后 lock出作用域 析构
-        }else{
-            _offMsgModel.insert(toid,js.dump());   // 注意插入offMsg数据库中 todi
         }
     }
+
+    // 查询是否数据库中在线 
+    User user = _userModel.query(toid);
+    if(user.getState() != OFFLINE)
+    {
+        _redis.publish(toid,js.dump());  //告诉其他的服务器 你有消息
+        return;
+    }
+
+
+    _offMsgModel.insert(toid,js.dump());   // 注意插入offMsg数据库中 todi
 }
 
 
@@ -321,8 +349,18 @@ void ChatService::groupChat(const TcpConnectionPtr &conn, json &js,Timestamp tim
         if(it!=_connMap.end())
         {
             it->second->send(js.dump());
-        }else{
-            _offMsgModel.insert(id,js.dump());
+        }
+        else{
+        // 查一下数据库 是否用户online
+            User user = _userModel.query(id);
+            if(user.getState() != OFFLINE)
+            {
+                _redis.publish(id,js.dump());
+            }
+            else{
+                _offMsgModel.insert(id,js.dump());
+            }
+            
         }
     }
 }
@@ -366,4 +404,20 @@ void ChatService::rest()
 {
     // 把online状态的用户 设置为offline
     _userModel.resetState();
+}
+
+
+/*==================redis消息队列=============*/
+// 从redis消息队列中获取订阅的消息
+void ChatService::handleRedisSubscribeMessage(int userid, string msg)
+{
+    lock_guard<mutex> lock(_connMutex);
+    auto it = _connMap.find(userid);
+    if (it != _connMap.end())
+    {
+        it->second->send(msg);
+        return;
+    }
+    // 存储该用户的离线消息  可能这哈用户刚好退下
+    _offMsgModel.insert(userid, msg);
 }

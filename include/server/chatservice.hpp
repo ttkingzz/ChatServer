@@ -15,6 +15,7 @@ using namespace std;
 #include "friendmodel.hpp"
 #include "offlinemessagemodel.hpp"
 #include "groupmodel.hpp"
+#include "redis.hpp"
 // 表示处理消息的事件  回调方法类型
 using MsgHalder = std::function<void(const TcpConnectionPtr &conn, json &js,Timestamp time)>;
 
@@ -50,6 +51,9 @@ public:
     void rest();
     // 获取消息对应的处理器
     MsgHalder getHandler(int msgID);
+
+    // 从redis消息队列中获取订阅的消息
+    void handleRedisSubscribeMessage(int, string);
 private:
     ChatService();
 
@@ -75,6 +79,10 @@ private:
 
     // 群组
     GroupModel _groupModel;
+
+    
+    // redis操作对象
+    Redis _redis;
 };
 
 
